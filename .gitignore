@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.local
+dist/
+build/
+.firebase/
+firebase-debug.log
+.DS_Store
+*.log
+serviceAccountKey.json
