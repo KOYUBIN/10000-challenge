@@ -9,9 +9,9 @@ import AddTradeModal from './AddTradeModal';
 import CloseTradeModal from './CloseTradeModal';
 
 export default function TradeJournal() {
-  const { user, getToken } = useAuth();
+  const { user } = useAuth();
   const [trades, setTrades] = useState([]);
-  const [filter, setFilter] = useState('ALL'); // ALL | OPEN | WIN | LOSE | MY
+  const [filter, setFilter] = useState('ALL');
   const [showAdd, setShowAdd] = useState(false);
   const [closing, setClosing] = useState(null);
 
@@ -32,18 +32,18 @@ export default function TradeJournal() {
   });
 
   const handleAdd = async (data) => {
-    await api.addTrade(data, getToken);
+    await api.addTrade(data);
     setShowAdd(false);
   };
 
   const handleClose = async (id, data) => {
-    await api.closeTrade(id, data, getToken);
+    await api.closeTrade(id, data);
     setClosing(null);
   };
 
   const handleDelete = async (id) => {
     if (!confirm('정말 삭제하시겠습니까?')) return;
-    await api.deleteTrade(id, getToken);
+    await api.deleteTrade(id);
   };
 
   const stats = {
@@ -52,9 +52,10 @@ export default function TradeJournal() {
     win: trades.filter((t) => t.status === 'WIN').length,
     lose: trades.filter((t) => t.status === 'LOSE').length,
   };
-  const winRate = stats.win + stats.lose > 0
-    ? ((stats.win / (stats.win + stats.lose)) * 100).toFixed(1)
-    : '-';
+  const winRate =
+    stats.win + stats.lose > 0
+      ? ((stats.win / (stats.win + stats.lose)) * 100).toFixed(1)
+      : '-';
   const totalPnl = trades.reduce((s, t) => s + (t.pnl || 0), 0);
 
   return (
@@ -67,7 +68,6 @@ export default function TradeJournal() {
         </button>
       </div>
 
-      {/* 통계 */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         {[
           { label: '전체 거래', value: stats.total },
@@ -86,7 +86,6 @@ export default function TradeJournal() {
         ))}
       </div>
 
-      {/* 필터 */}
       <div className="flex items-center gap-2">
         <Filter size={14} className="text-gray-500" />
         {['ALL', 'MY', 'OPEN', 'WIN', 'LOSE'].map((f) => (
@@ -104,7 +103,6 @@ export default function TradeJournal() {
         ))}
       </div>
 
-      {/* 목록 */}
       {filtered.length === 0 ? (
         <div className="card text-center py-12 text-gray-500">
           <p>표시할 매매 기록이 없습니다.</p>

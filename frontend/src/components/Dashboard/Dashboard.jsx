@@ -1,28 +1,36 @@
 import React, { useEffect, useState } from 'react';
 import { db } from '../../firebase';
-import { collection, query, orderBy, onSnapshot, where } from 'firebase/firestore';
+import { collection, query, orderBy, onSnapshot } from 'firebase/firestore';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../utils/api';
+import { cachedCall } from '../../utils/cache';
+import { RefreshCw } from 'lucide-react';
 import BankrollCard from './BankrollCard';
 import BankrollChart from './BankrollChart';
 import Leaderboard from '../Leaderboard/Leaderboard';
 import RecentTrades from './RecentTrades';
 import BinanceSyncModal from './BinanceSyncModal';
 
+const PROFILE_TTL  = 5  * 60_000; // 5분
+const HISTORY_TTL  = 10 * 60_000; // 10분
+const LEADER_TTL   = 10 * 60_000; // 10분
+
 export default function Dashboard() {
-  const { user, getToken } = useAuth();
-  const [profile, setProfile] = useState(null);
-  const [history, setHistory] = useState([]);
+  const { user } = useAuth();
+  const [profile, setProfile]       = useState(null);
+  const [history, setHistory]       = useState([]);
   const [leaderboard, setLeaderboard] = useState([]);
   const [recentTrades, setRecentTrades] = useState([]);
-  const [showSync, setShowSync] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const [showSync, setShowSync]     = useState(false);
+  const [loading, setLoading]       = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState(null);
 
   useEffect(() => {
     if (!user) return;
-    loadData();
+    loadData(false); // 최초 로드 - 캐시 우선
 
-    // 실시간 매매일지 구독
+    // 매매일지는 Firestore 실시간 구독 (무료 읽기 범위)
     const q = query(collection(db, 'trades'), orderBy('createdAt', 'desc'));
     const unsub = onSnapshot(q, (snap) => {
       const trades = [];
@@ -32,46 +40,58 @@ export default function Dashboard() {
     return unsub;
   }, [user]);
 
-  async function loadData() {
-    setLoading(true);
+  async function loadData(forceRefresh = false) {
+    forceRefresh ? setRefreshing(true) : setLoading(true);
     try {
       const [prof, hist, lb] = await Promise.all([
-        api.getProfile(getToken).catch(() => null),
-        api.getBankrollHistory(getToken).catch(() => []),
-        api.getBankrollSummary(getToken).catch(() => []),
+        cachedCall('dashboard_profile',  () => api.getProfile(),           PROFILE_TTL,  forceRefresh).catch(() => null),
+        cachedCall('dashboard_history',  () => api.getBankrollHistory(),   HISTORY_TTL,  forceRefresh).catch(() => []),
+        cachedCall('dashboard_leader',   () => api.getBankrollSummary(),   LEADER_TTL,   forceRefresh).catch(() => []),
       ]);
       setProfile(prof);
       setHistory(hist);
       setLeaderboard(lb);
+      setLastUpdated(new Date());
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
   }
 
   if (loading) {
-    return (
-      <div className="flex items-center justify-center h-64 text-gray-400">
-        데이터 로딩 중...
-      </div>
-    );
+    return <div className="flex items-center justify-center h-64 text-gray-400">데이터 로딩 중...</div>;
   }
 
-  const bankroll = profile?.bankroll || 100;
-  const target = profile?.target || 10000;
+  const bankroll       = profile?.bankroll      || 100;
+  const target         = profile?.target        || 10000;
   const initialBankroll = profile?.initialBankroll || 100;
-  const progress = Math.min((bankroll / target) * 100, 100);
-  const roi = (((bankroll - initialBankroll) / initialBankroll) * 100).toFixed(2);
+  const progress       = Math.min((bankroll / target) * 100, 100);
+  const roi            = (((bankroll - initialBankroll) / initialBankroll) * 100).toFixed(2);
+  const fmtTime        = (d) => d ? `${d.getHours()}:${String(d.getMinutes()).padStart(2,'0')} 기준` : '';
 
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-xl font-bold">대시보드</h1>
+        <div className="flex items-center gap-3">
+          <h1 className="text-xl font-bold">대시보드</h1>
+          {lastUpdated && (
+            <span className="text-xs text-gray-600">{fmtTime(lastUpdated)}</span>
+          )}
+          {/* 새로고침 버튼 - 누를 때만 Firestore 재호출 */}
+          <button
+            onClick={() => loadData(true)}
+            disabled={refreshing}
+            title="데이터 새로고침"
+            className="text-gray-500 hover:text-brand-500 transition-colors disabled:opacity-40"
+          >
+            <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} />
+          </button>
+        </div>
         <button onClick={() => setShowSync(true)} className="btn-ghost text-sm">
           바이낸스 동기화
         </button>
       </div>
 
-      {/* 뱅크롤 카드 */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <BankrollCard
           label="현재 뱅크롤"
@@ -99,7 +119,6 @@ export default function Dashboard() {
         />
       </div>
 
-      {/* 차트 + 리더보드 */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <div className="lg:col-span-2">
           <BankrollChart history={history} bankroll={bankroll} target={target} />
@@ -109,16 +128,15 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* 최근 매매 */}
       <RecentTrades trades={recentTrades} />
 
       {showSync && (
         <BinanceSyncModal
           onClose={() => setShowSync(false)}
-          onSync={async (apiKey, apiSecret) => {
-            await api.syncBinance(apiKey, apiSecret, getToken);
+          onSync={async (apiKey, apiSecret, saveKey) => {
+            await api.syncBinance(apiKey, apiSecret, saveKey);
             setShowSync(false);
-            loadData();
+            loadData(true); // 동기화 후 강제 새로고침
           }}
         />
       )}
@@ -129,10 +147,7 @@ export default function Dashboard() {
 function ProgressBar({ pct }) {
   return (
     <div className="w-full bg-dark-600 rounded-full h-1.5 mt-1">
-      <div
-        className="bg-brand-500 h-1.5 rounded-full transition-all"
-        style={{ width: `${pct}%` }}
-      />
+      <div className="bg-brand-500 h-1.5 rounded-full transition-all" style={{ width: `${pct}%` }} />
     </div>
   );
 }
