@@ -1,12 +1,94 @@
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
-const Binance = require('binance-api-node').default;
+const https = require('https');
+const crypto = require('crypto');
 
 admin.initializeApp();
 const db = admin.firestore();
 
 // ─────────────────────────────────────────────
-// 바이낸스 잔고 동기화 (사이트에서 버튼 클릭 시)
+// 바이낸스 REST API 직접 호출 헬퍼
+// ─────────────────────────────────────────────
+function binanceRequest(path, params, apiKey, apiSecret) {
+  return new Promise((resolve, reject) => {
+    const queryString = new URLSearchParams({
+      ...params,
+      timestamp: Date.now(),
+    }).toString();
+
+    const signature = crypto
+      .createHmac('sha256', apiSecret)
+      .update(queryString)
+      .digest('hex');
+
+    const url = `/fapi/v2/${path}?${queryString}&signature=${signature}`;
+
+    const options = {
+      hostname: 'fapi.binance.com',
+      path: url,
+      method: 'GET',
+      headers: { 'X-MBX-APIKEY': apiKey },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.code && parsed.code < 0) {
+            reject(new Error(`바이낸스 오류 ${parsed.code}: ${parsed.msg}`));
+          } else {
+            resolve(parsed);
+          }
+        } catch (e) {
+          reject(new Error('응답 파싱 실패: ' + data));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(10000, () => {
+      req.destroy();
+      reject(new Error('바이낸스 요청 타임아웃'));
+    });
+    req.end();
+  });
+}
+
+// 공개 API (서명 불필요)
+function binancePublicRequest(path, params) {
+  return new Promise((resolve, reject) => {
+    const queryString = new URLSearchParams(params).toString();
+    const options = {
+      hostname: 'fapi.binance.com',
+      path: `/fapi/v1/${path}?${queryString}`,
+      method: 'GET',
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(new Error('응답 파싱 실패'));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(10000, () => {
+      req.destroy();
+      reject(new Error('타임아웃'));
+    });
+    req.end();
+  });
+}
+
+// ─────────────────────────────────────────────
+// 바이낸스 잔고 동기화
 // ─────────────────────────────────────────────
 exports.syncBinanceBalance = functions.https.onCall(async (data, context) => {
   if (!context.auth) {
@@ -19,10 +101,9 @@ exports.syncBinanceBalance = functions.https.onCall(async (data, context) => {
   }
 
   try {
-    const client = Binance({ apiKey, apiSecret });
-    const info = await client.futuresAccountInfo();
-    const usdt = info.assets.find((a) => a.asset === 'USDT');
+    const account = await binanceRequest('account', {}, apiKey, apiSecret);
 
+    const usdt = (account.assets || []).find((a) => a.asset === 'USDT');
     const walletBalance = parseFloat(usdt?.walletBalance || 0);
     const unrealizedProfit = parseFloat(usdt?.unrealizedProfit || 0);
     const total = walletBalance + unrealizedProfit;
@@ -31,11 +112,10 @@ exports.syncBinanceBalance = functions.https.onCall(async (data, context) => {
       bankroll: total,
       walletBalance,
       unrealizedProfit,
-      availableBalance: parseFloat(info.availableBalance || 0),
+      availableBalance: parseFloat(account.availableBalance || 0),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    // 자동 동기화를 위해 키 저장 옵션
     if (saveKey) {
       userUpdate.binanceApiKey = apiKey;
       userUpdate.binanceApiSecret = apiSecret;
@@ -52,6 +132,7 @@ exports.syncBinanceBalance = functions.https.onCall(async (data, context) => {
 
     return { success: true, balance: total, walletBalance, unrealizedProfit };
   } catch (err) {
+    console.error('[syncBinanceBalance] 오류:', err.message);
     throw new functions.https.HttpsError('internal', `바이낸스 연동 실패: ${err.message}`);
   }
 });
@@ -70,8 +151,7 @@ exports.getOpenPositions = functions.https.onCall(async (data, context) => {
   }
 
   try {
-    const client = Binance({ apiKey, apiSecret });
-    const positions = await client.futuresPositionRisk();
+    const positions = await binanceRequest('positionRisk', {}, apiKey, apiSecret);
     return positions
       .filter((p) => parseFloat(p.positionAmt) !== 0)
       .map((p) => ({
@@ -85,35 +165,35 @@ exports.getOpenPositions = functions.https.onCall(async (data, context) => {
         side: parseFloat(p.positionAmt) > 0 ? 'LONG' : 'SHORT',
       }));
   } catch (err) {
+    console.error('[getOpenPositions] 오류:', err.message);
     throw new functions.https.HttpsError('internal', `포지션 조회 실패: ${err.message}`);
   }
 });
 
 // ─────────────────────────────────────────────
-// 캔들 차트 데이터 (공개 API - 인증 불필요)
+// 캔들 차트 데이터 (공개 API)
 // ─────────────────────────────────────────────
 exports.getKlines = functions.https.onCall(async (data) => {
   const { symbol = 'BTCUSDT', interval = '1h', limit = 200 } = data;
 
   try {
-    const client = Binance({});
-    const candles = await client.futuresCandles({ symbol, interval, limit });
+    const candles = await binancePublicRequest('klines', { symbol, interval, limit });
     return candles.map((c) => ({
-      time: c.openTime / 1000,
-      open: parseFloat(c.open),
-      high: parseFloat(c.high),
-      low: parseFloat(c.low),
-      close: parseFloat(c.close),
-      volume: parseFloat(c.volume),
+      time: c[0] / 1000,
+      open: parseFloat(c[1]),
+      high: parseFloat(c[2]),
+      low: parseFloat(c[3]),
+      close: parseFloat(c[4]),
+      volume: parseFloat(c[5]),
     }));
   } catch (err) {
+    console.error('[getKlines] 오류:', err.message);
     throw new functions.https.HttpsError('internal', `차트 데이터 로드 실패: ${err.message}`);
   }
 });
 
 // ─────────────────────────────────────────────
-// 자동 동기화 - 10분마다 실행 (Cron)
-// API 키를 저장한 유저들의 뱅크롤 자동 업데이트
+// 자동 동기화 Cron (10분마다)
 // ─────────────────────────────────────────────
 exports.scheduledBankrollSync = functions.pubsub
   .schedule('every 10 minutes')
@@ -128,15 +208,10 @@ exports.scheduledBankrollSync = functions.pubsub
       if (!user.binanceApiKey || !user.binanceApiSecret) return;
 
       try {
-        const client = Binance({
-          apiKey: user.binanceApiKey,
-          apiSecret: user.binanceApiSecret,
-        });
-        const info = await client.futuresAccountInfo();
-        const usdt = info.assets.find((a) => a.asset === 'USDT');
+        const account = await binanceRequest('account', {}, user.binanceApiKey, user.binanceApiSecret);
+        const usdt = (account.assets || []).find((a) => a.asset === 'USDT');
         const total =
-          parseFloat(usdt?.walletBalance || 0) +
-          parseFloat(usdt?.unrealizedProfit || 0);
+          parseFloat(usdt?.walletBalance || 0) + parseFloat(usdt?.unrealizedProfit || 0);
 
         await db.collection('users').doc(docSnap.id).update({
           bankroll: total,
