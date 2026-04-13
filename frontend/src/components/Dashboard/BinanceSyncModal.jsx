@@ -15,7 +15,10 @@ export default function BinanceSyncModal({ onClose, onSync }) {
     try {
       await onSync(apiKey, apiSecret, saveKey);
     } catch (err) {
-      setError(err.message);
+      // Firebase Functions 에러 상세 메시지 표시
+      const msg = err?.details || err?.message || String(err);
+      setError(msg);
+      console.error('[BinanceSync] 상세 에러:', err);
     } finally {
       setLoading(false);
     }
