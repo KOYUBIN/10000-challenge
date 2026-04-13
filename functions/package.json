@@ -1,7 +1,7 @@
 {
   "name": "10000-challenge-functions",
   "description": "Firebase Cloud Functions for 10000 challenge",
-  "engines": { "node": "18" },
+  "engines": { "node": "20" },
   "main": "index.js",
   "scripts": {
     "serve": "firebase emulators:start --only functions",
