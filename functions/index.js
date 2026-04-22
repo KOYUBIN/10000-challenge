@@ -1,4 +1,5 @@
-const functions = require('firebase-functions');
+const { onCall, HttpsError } = require('firebase-functions/v2/https');
+const { onSchedule } = require('firebase-functions/v2/scheduler');
 const admin = require('firebase-admin');
 const https = require('https');
 const crypto = require('crypto');
@@ -90,14 +91,14 @@ function binancePublicRequest(path, params) {
 // ─────────────────────────────────────────────
 // 바이낸스 잔고 동기화
 // ─────────────────────────────────────────────
-exports.syncBinanceBalance = functions.https.onCall(async (data, context) => {
-  if (!context.auth) {
-    throw new functions.https.HttpsError('unauthenticated', '로그인이 필요합니다.');
+exports.syncBinanceBalance = onCall(async (request) => {
+  if (!request.auth) {
+    throw new HttpsError('unauthenticated', '로그인이 필요합니다.');
   }
 
-  const { apiKey, apiSecret, saveKey = false } = data;
+  const { apiKey, apiSecret, saveKey = false } = request.data;
   if (!apiKey || !apiSecret) {
-    throw new functions.https.HttpsError('invalid-argument', 'API Key와 Secret을 입력해주세요.');
+    throw new HttpsError('invalid-argument', 'API Key와 Secret을 입력해주세요.');
   }
 
   try {
@@ -121,10 +122,10 @@ exports.syncBinanceBalance = functions.https.onCall(async (data, context) => {
       userUpdate.binanceApiSecret = apiSecret;
     }
 
-    await db.collection('users').doc(context.auth.uid).set(userUpdate, { merge: true });
+    await db.collection('users').doc(request.auth.uid).set(userUpdate, { merge: true });
 
     await db.collection('bankrollHistory').add({
-      userId: context.auth.uid,
+      userId: request.auth.uid,
       bankroll: total,
       source: 'manual_sync',
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -133,21 +134,21 @@ exports.syncBinanceBalance = functions.https.onCall(async (data, context) => {
     return { success: true, balance: total, walletBalance, unrealizedProfit };
   } catch (err) {
     console.error('[syncBinanceBalance] 오류:', err.message);
-    throw new functions.https.HttpsError('internal', `바이낸스 연동 실패: ${err.message}`);
+    throw new HttpsError('internal', `바이낸스 연동 실패: ${err.message}`);
   }
 });
 
 // ─────────────────────────────────────────────
 // 열린 포지션 조회
 // ─────────────────────────────────────────────
-exports.getOpenPositions = functions.https.onCall(async (data, context) => {
-  if (!context.auth) {
-    throw new functions.https.HttpsError('unauthenticated', '로그인이 필요합니다.');
+exports.getOpenPositions = onCall(async (request) => {
+  if (!request.auth) {
+    throw new HttpsError('unauthenticated', '로그인이 필요합니다.');
   }
 
-  const { apiKey, apiSecret } = data;
+  const { apiKey, apiSecret } = request.data;
   if (!apiKey || !apiSecret) {
-    throw new functions.https.HttpsError('invalid-argument', 'API Key와 Secret을 입력해주세요.');
+    throw new HttpsError('invalid-argument', 'API Key와 Secret을 입력해주세요.');
   }
 
   try {
@@ -166,15 +167,15 @@ exports.getOpenPositions = functions.https.onCall(async (data, context) => {
       }));
   } catch (err) {
     console.error('[getOpenPositions] 오류:', err.message);
-    throw new functions.https.HttpsError('internal', `포지션 조회 실패: ${err.message}`);
+    throw new HttpsError('internal', `포지션 조회 실패: ${err.message}`);
   }
 });
 
 // ─────────────────────────────────────────────
 // 캔들 차트 데이터 (공개 API)
 // ─────────────────────────────────────────────
-exports.getKlines = functions.https.onCall(async (data) => {
-  const { symbol = 'BTCUSDT', interval = '1h', limit = 200 } = data;
+exports.getKlines = onCall(async (request) => {
+  const { symbol = 'BTCUSDT', interval = '1h', limit = 200 } = request.data;
 
   try {
     const candles = await binancePublicRequest('klines', { symbol, interval, limit });
@@ -188,51 +189,48 @@ exports.getKlines = functions.https.onCall(async (data) => {
     }));
   } catch (err) {
     console.error('[getKlines] 오류:', err.message);
-    throw new functions.https.HttpsError('internal', `차트 데이터 로드 실패: ${err.message}`);
+    throw new HttpsError('internal', `차트 데이터 로드 실패: ${err.message}`);
   }
 });
 
 // ─────────────────────────────────────────────
 // 자동 동기화 Cron (10분마다)
 // ─────────────────────────────────────────────
-exports.scheduledBankrollSync = functions.pubsub
-  .schedule('every 10 minutes')
-  .onRun(async () => {
-    const snapshot = await db
-      .collection('users')
-      .where('binanceApiKey', '!=', null)
-      .get();
+exports.scheduledBankrollSync = onSchedule('every 10 minutes', async (event) => {
+  const snapshot = await db
+    .collection('users')
+    .where('binanceApiKey', '!=', null)
+    .get();
 
-    const updates = snapshot.docs.map(async (docSnap) => {
-      const user = docSnap.data();
-      if (!user.binanceApiKey || !user.binanceApiSecret) return;
+  const updates = snapshot.docs.map(async (docSnap) => {
+    const user = docSnap.data();
+    if (!user.binanceApiKey || !user.binanceApiSecret) return;
 
-      try {
-        const account = await binanceRequest('account', {}, user.binanceApiKey, user.binanceApiSecret);
-        const usdt = (account.assets || []).find((a) => a.asset === 'USDT');
-        const total =
-          parseFloat(usdt?.walletBalance || 0) + parseFloat(usdt?.unrealizedProfit || 0);
+    try {
+      const account = await binanceRequest('account', {}, user.binanceApiKey, user.binanceApiSecret);
+      const usdt = (account.assets || []).find((a) => a.asset === 'USDT');
+      const total =
+        parseFloat(usdt?.walletBalance || 0) + parseFloat(usdt?.unrealizedProfit || 0);
 
-        await db.collection('users').doc(docSnap.id).update({
-          bankroll: total,
-          walletBalance: parseFloat(usdt?.walletBalance || 0),
-          unrealizedProfit: parseFloat(usdt?.unrealizedProfit || 0),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
+      await db.collection('users').doc(docSnap.id).update({
+        bankroll: total,
+        walletBalance: parseFloat(usdt?.walletBalance || 0),
+        unrealizedProfit: parseFloat(usdt?.unrealizedProfit || 0),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
 
-        await db.collection('bankrollHistory').add({
-          userId: docSnap.id,
-          bankroll: total,
-          source: 'auto_sync',
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
+      await db.collection('bankrollHistory').add({
+        userId: docSnap.id,
+        bankroll: total,
+        source: 'auto_sync',
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
 
-        console.log(`[AutoSync] ${docSnap.id}: $${total}`);
-      } catch (e) {
-        console.error(`[AutoSync] ${docSnap.id} 실패:`, e.message);
-      }
-    });
-
-    await Promise.allSettled(updates);
-    return null;
+      console.log(`[AutoSync] ${docSnap.id}: $${total}`);
+    } catch (e) {
+      console.error(`[AutoSync] ${docSnap.id} 실패:`, e.message);
+    }
   });
+
+  await Promise.allSettled(updates);
+});
